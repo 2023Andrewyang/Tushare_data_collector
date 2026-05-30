@@ -1,487 +1,320 @@
 # -*- coding: utf-8 -*-
-"""
-采集器基类
-定义所有采集器的通用接口和方法
+"""采集器基类：幂等写入 + 失败记录 + 积分门控 + 列对齐清洗。
+
+提供 4 个基类，封装所有「循环 / 幂等写入 / 失败记录 / 积分门控 / 列对齐清洗」逻辑：
+- DateBasedCollector    子类实现 fetch_by_date(trade_date)
+- StockBasedCollector   子类实现 fetch_by_stock(ts_code, start, end)
+- PeriodBasedCollector  子类实现 fetch_by_period(period)
+- SnapshotCollector     子类实现 fetch_snapshot(**kwargs)
+
+子类只负责「给定参数 -> 返回干净的 DataFrame」，不写循环/进度/失败/清洗。
 """
 import logging
 from abc import ABC, abstractmethod
-from typing import List, Dict, Any, Optional
 from datetime import datetime
-import asyncio
 
+import numpy as np
 import pandas as pd
 
 from config.settings import settings
-from core.database import get_db_manager, MongoDBManager
-from core.tushare_client import get_tushare_client, TushareClient
-from core.task_manager import get_task_manager, TaskManager, TaskStatus
-from core.failure_handler import get_failure_handler, FailureHandler
+from core.database import get_db_manager
+from core.tushare_client import get_tushare_client
+from core.failure_handler import get_failure_handler
+from models.schema import TABLES
 
 logger = logging.getLogger(__name__)
 
+DATE_COLS = {"trade_date", "cal_date", "ann_date", "end_date",
+             "list_date", "delist_date", "pretrade_date", "snapshot_date"}
+
 
 class BaseCollector(ABC):
-    """采集器基类"""
-    
-    # 子类需要覆盖的属性
-    TASK_NAME: str = None           # 任务名称
-    COLLECTION_NAME: str = None     # 集合名称
-    KEY_FIELDS: List[str] = []      # 主键字段
-    
+    """采集器抽象基类。"""
+
+    TASK_NAME: str = None        # 任务名，与表名/接口名一致
+    TABLE_NAME: str = None       # 目标表名
+    KEY_FIELDS: list = []        # 主键字段
+    REQUIRED_POINTS: int = 0     # 该接口所需积分门槛，无门槛填 0
+
     def __init__(self):
-        self.db: MongoDBManager = get_db_manager()
-        self.client: TushareClient = get_tushare_client()
-        self.task_manager: TaskManager = get_task_manager()
-        self.failure_handler: FailureHandler = get_failure_handler()
-        
-        self._validate_config()
-    
-    def _validate_config(self):
-        """验证配置"""
-        if not self.TASK_NAME:
-            raise ValueError(f"{self.__class__.__name__} 未设置 TASK_NAME")
-        if not self.COLLECTION_NAME:
-            raise ValueError(f"{self.__class__.__name__} 未设置 COLLECTION_NAME")
-    
-    @abstractmethod
-    def collect_full(self, start_date: str = None, end_date: str = None) -> Dict:
+        self.db = get_db_manager()
+        self.client = get_tushare_client()
+        self.failure = get_failure_handler()
+        if not self.TASK_NAME or not self.TABLE_NAME:
+            raise ValueError(f"{type(self).__name__} 未设置 TASK_NAME/TABLE_NAME")
+
+    # ---------- 积分门控 ----------
+    def can_run(self) -> bool:
+        if self.client.points < self.REQUIRED_POINTS:
+            logger.warning(f"[{self.TASK_NAME}] 积分不足"
+                           f"（需要 {self.REQUIRED_POINTS}，当前 {self.client.points}），跳过")
+            return False
+        return True
+
+    # ---------- 列对齐 + 清洗（90 文档第九节）----------
+    def align_columns(self, df: pd.DataFrame, table_name: str = None) -> pd.DataFrame:
+        """按 schema 表列裁剪/补齐 DataFrame，并做日期->str、NaN->None 清洗。
+
+        table_name 默认用 self.TABLE_NAME；top_list 等需写多表时可显式传入。
         """
-        全量采集数据
-        
-        Args:
-            start_date: 开始日期
-            end_date: 结束日期
-            
-        Returns:
-            采集结果统计
-        """
-        pass
-    
-    @abstractmethod
-    def collect_incremental(self, trade_date: str = None) -> Dict:
-        """
-        增量采集数据
-        
-        Args:
-            trade_date: 交易日期，默认为当天
-            
-        Returns:
-            采集结果统计
-        """
-        pass
-    
-    def save_data(self, df: pd.DataFrame) -> Dict:
-        """
-        保存数据到MongoDB
-        
-        Args:
-            df: 数据DataFrame
-            
-        Returns:
-            保存结果 {"success": int, "failed": int}
-        """
+        if df is None or df.empty:
+            return pd.DataFrame()
+        table = TABLES[table_name or self.TABLE_NAME]
+        cols = [c.name for c in table.columns if c.name != "created_at"]
+        df = df.copy()
+        # 补缺列
+        for c in cols:
+            if c not in df.columns:
+                df[c] = None
+        # 丢多余列
+        df = df[[c for c in cols if c in df.columns]].copy()
+        # 日期列转字符串
+        for c in df.columns:
+            if c in DATE_COLS:
+                df[c] = df[c].apply(
+                    lambda v: None if pd.isna(v) else str(v).split(".")[0])
+        # NaN -> None
+        df = df.replace({np.nan: None})
+        # pandas 可能残留 NaT/<NA>，统一兜底
+        df = df.where(pd.notna(df), None)
+        return df
+
+    # ---------- 写入 ----------
+    def save(self, df: pd.DataFrame, update_on_conflict: bool = False,
+             table_name: str = None, key_fields: list = None) -> dict:
+        df = self.align_columns(df, table_name)
         if df.empty:
             return {"success": 0, "failed": 0}
-        
-        # 转换为字典列表
-        data_list = df.to_dict('records')
-        
-        # 批量upsert
-        result = self.db.upsert_many(
-            self.COLLECTION_NAME,
-            data_list,
-            self.KEY_FIELDS
-        )
-        
-        logger.info(
-            f"[{self.TASK_NAME}] 保存数据: 成功 {result['success']}, 失败 {result['failed']}"
-        )
-        
-        return result
-    
-    def get_trade_dates(self, start_date: str, end_date: str) -> List[str]:
-        """
-        获取日期范围内的交易日列表
-        
-        Args:
-            start_date: 开始日期
-            end_date: 结束日期
-            
-        Returns:
-            交易日列表
-        """
-        dates = self.db.find_many(
-            settings.COLLECTION_TRADE_CALENDAR,
-            {
-                "cal_date": {"$gte": start_date, "$lte": end_date},
-                "is_open": 1
-            },
-            projection={"cal_date": 1, "_id": 0},
-            sort=[("cal_date", 1)]
-        )
-        return [d["cal_date"] for d in dates]
-    
-    def get_stock_list(self, include_delisted: bool = True) -> List[str]:
-        """
-        获取股票代码列表
-        
-        Args:
-            include_delisted: 是否包含退市股票
-            
-        Returns:
-            股票代码列表
-        """
-        filter_dict = {}
-        if not include_delisted:
-            filter_dict["list_status"] = "L"
-        
-        stocks = self.db.find_many(
-            settings.COLLECTION_STOCK_LIST,
-            filter_dict,
-            projection={"ts_code": 1, "_id": 0}
-        )
-        return [s["ts_code"] for s in stocks]
-    
-    def get_latest_date(self, ts_code: str = None) -> Optional[str]:
-        """
-        获取指定股票或全部数据的最新日期
-        
-        Args:
-            ts_code: 股票代码，None表示全部
-            
-        Returns:
-            最新日期字符串
-        """
-        filter_dict = {"ts_code": ts_code} if ts_code else {}
-        return self.db.get_max_value(
-            self.COLLECTION_NAME,
-            "trade_date",
-            filter_dict
-        )
-    
-    def record_failure(self, ts_code: str = None, trade_date: str = None,
-                       error: Exception = None, error_message: str = None,
-                       context: Dict = None):
-        """记录失败"""
-        self.failure_handler.record_failure(
-            task_name=self.TASK_NAME,
-            ts_code=ts_code,
-            trade_date=trade_date,
-            error=error,
-            error_message=error_message,
-            context=context
-        )
-    
+        rows = df.to_dict("records")
+        r = self.db.bulk_upsert(table_name or self.TABLE_NAME, rows,
+                                key_fields or self.KEY_FIELDS, update_on_conflict)
+        logger.info(f"[{self.TASK_NAME}] 写入 {r['affected']}/{r['received']}")
+        return {"success": r["affected"], "failed": 0}
+
+    # ---------- 失败 ----------
+    def record_failure(self, trade_date=None, ts_code=None, error=None, context=None):
+        self.failure.record_failure(self.TASK_NAME, trade_date=trade_date,
+                                    ts_code=ts_code, error=error, context=context)
+
+    # ---------- 公共查询 ----------
+    def get_trade_dates(self, start_date, end_date, exchange="SSE") -> list:
+        rows = self.db.fetch_all(
+            f"SELECT cal_date FROM {settings.TBL_TRADE_CALENDAR} "
+            f"WHERE exchange=:ex AND is_open=1 AND cal_date>=:s AND cal_date<=:e "
+            f"ORDER BY cal_date", {"ex": exchange, "s": start_date, "e": end_date})
+        return [r["cal_date"] for r in rows]
+
+    def get_stock_codes(self, only_listed=False) -> list:
+        where = "list_status='L'" if only_listed else None
+        sql = f"SELECT ts_code FROM {settings.TBL_STOCK_BASIC}"
+        if where:
+            sql += f" WHERE {where}"
+        return [r["ts_code"] for r in self.db.fetch_all(sql)]
+
     def get_today(self) -> str:
-        """获取今天的日期字符串"""
         return datetime.now().strftime("%Y%m%d")
-    
-    def print_stats(self, stats: Dict):
-        """打印统计信息"""
-        print(f"\n[{self.TASK_NAME}] 采集完成:")
-        print(f"  成功: {stats.get('success', 0)}")
-        print(f"  失败: {stats.get('failed', 0)}")
-        if 'total_records' in stats:
-            print(f"  总记录数: {stats['total_records']}")
-        if 'duration' in stats:
-            print(f"  耗时: {stats['duration']:.2f}秒")
+
+    # ---------- 顶层入口（命令层调用）----------
+    @abstractmethod
+    def run_full(self, start_date=None, end_date=None) -> dict: ...
+
+    @abstractmethod
+    def run_incremental(self, trade_date=None) -> dict: ...
+
+    def run_backfill(self, start_date, end_date) -> dict:
+        """默认：等同 run_full 但强制覆盖写。子类一般无需重写。"""
+        return self.run_full(start_date, end_date, _update=True)
 
 
 class DateBasedCollector(BaseCollector):
-    """
-    基于日期的采集器基类
-    适用于按日期批量获取全市场数据的场景
-    """
-    
+    """按交易日批量取全市场数据（daily、daily_basic、moneyflow…）。"""
+
     @abstractmethod
-    def fetch_by_date(self, trade_date: str) -> pd.DataFrame:
-        """
-        获取指定日期的数据
-        
-        Args:
-            trade_date: 交易日期
-            
-        Returns:
-            数据DataFrame
-        """
-        pass
-    
-    def collect_full(self, start_date: str = None, end_date: str = None) -> Dict:
-        """全量采集（按日期遍历）"""
+    def fetch_by_date(self, trade_date: str) -> pd.DataFrame: ...
+
+    def run_full(self, start_date=None, end_date=None, _update=False) -> dict:
+        if not self.can_run():
+            return {"success": 0, "failed": 0, "skipped": True}
         start_date = start_date or settings.data.start_date
         end_date = end_date or self.get_today()
-        
-        logger.info(f"[{self.TASK_NAME}] 开始全量采集: {start_date} - {end_date}")
-        
-        # 创建/恢复任务
-        task_name = f"{self.TASK_NAME}_full_{start_date}_{end_date}"
-        
-        # 获取交易日列表
-        trade_dates = self.get_trade_dates(start_date, end_date)
-        if not trade_dates:
-            logger.warning("未找到交易日数据，请先同步交易日历")
+        dates = self.get_trade_dates(start_date, end_date)
+        if not dates:
+            logger.warning(f"[{self.TASK_NAME}] 无交易日（请先同步 trade_calendar）")
             return {"success": 0, "failed": 0}
-        
-        total_trade_dates = len(trade_dates)
-        
-        # 检查是否需要断点续传
-        resume_point = self.task_manager.get_resume_point(task_name)
-        if resume_point["last_date"]:
-            # 从断点继续
-            original_count = len(trade_dates)
-            trade_dates = [d for d in trade_dates if d > resume_point["last_date"]]
-            skipped_count = original_count - len(trade_dates)
-            
-            logger.info("=" * 60)
-            logger.info(f"[{self.TASK_NAME}] ★★★ 检测到断点续传 ★★★")
-            logger.info(f"[{self.TASK_NAME}] 上次进度: 已处理到 {resume_point['last_date']}")
-            logger.info(f"[{self.TASK_NAME}] 已完成: {skipped_count} 个交易日")
-            logger.info(f"[{self.TASK_NAME}] 剩余待处理: {len(trade_dates)} 个交易日")
-            logger.info(f"[{self.TASK_NAME}] 总计: {total_trade_dates} 个交易日")
-            logger.info("=" * 60)
-        else:
-            logger.info("=" * 60)
-            logger.info(f"[{self.TASK_NAME}] 全新任务开始（无断点记录）")
-            logger.info(f"[{self.TASK_NAME}] 待处理: {len(trade_dates)} 个交易日")
-            logger.info("=" * 60)
-        
-        # 创建任务
-        self.task_manager.create_task(
-            task_name=task_name,
-            task_type=self.TASK_NAME,
-            total_items=len(trade_dates),
-            metadata={"start_date": start_date, "end_date": end_date}
-        )
-        self.task_manager.start_task(task_name)
-        
-        total_success = resume_point.get("processed_items", 0)
-        total_failed = 0
-        start_time = datetime.now()
-        
+        total_s = total_f = 0
+        t0 = datetime.now()
+        for i, d in enumerate(dates):
+            try:
+                df = self.fetch_by_date(d)
+                r = self.save(df, update_on_conflict=_update)
+                total_s += r["success"]
+            except KeyboardInterrupt:
+                logger.warning(f"[{self.TASK_NAME}] 用户中断于 {d}")
+                raise
+            except Exception as e:
+                logger.error(f"[{self.TASK_NAME}] {d} 失败: {e}")
+                self.record_failure(trade_date=d, error=e)
+                total_f += 1
+            if (i + 1) % 50 == 0:
+                logger.info(f"[{self.TASK_NAME}] {i + 1}/{len(dates)}")
+        return {"success": total_s, "failed": total_f,
+                "duration": (datetime.now() - t0).total_seconds()}
+
+    def run_incremental(self, trade_date=None, _update=False) -> dict:
+        if not self.can_run():
+            return {"success": 0, "failed": 0, "skipped": True}
+        d = trade_date or self.get_today()
         try:
-            for i, trade_date in enumerate(trade_dates):
-                try:
-                    df = self.fetch_by_date(trade_date)
-                    
-                    if not df.empty:
-                        result = self.save_data(df)
-                        total_success += result["success"]
-                        total_failed += result["failed"]
-                    
-                    # 更新进度
-                    self.task_manager.update_progress(
-                        task_name,
-                        increment_processed=1,
-                        last_processed_date=trade_date
-                    )
-                    
-                    if (i + 1) % 50 == 0:
-                        logger.info(f"[{self.TASK_NAME}] 进度: {i + 1}/{len(trade_dates)}")
-                        
-                except Exception as e:
-                    logger.error(f"[{self.TASK_NAME}] 采集失败 {trade_date}: {e}")
-                    self.record_failure(trade_date=trade_date, error=e)
-                    total_failed += 1
-                    self.task_manager.update_progress(task_name, increment_failed=1)
-            
-            # 完成任务
-            self.task_manager.complete_task(task_name)
-            
-        except KeyboardInterrupt:
-            logger.info("用户中断，保存进度...")
-            self.task_manager.pause_task(task_name)
-            raise
+            df = self.fetch_by_date(d)
+            return self.save(df, update_on_conflict=_update)
         except Exception as e:
-            logger.error(f"任务异常: {e}")
-            self.task_manager.complete_task(task_name, TaskStatus.FAILED)
-            raise
-        
-        duration = (datetime.now() - start_time).total_seconds()
-        
-        stats = {
-            "success": total_success,
-            "failed": total_failed,
-            "duration": duration
-        }
-        self.print_stats(stats)
-        
-        return stats
-    
-    def collect_incremental(self, trade_date: str = None) -> Dict:
-        """增量采集（指定日期或最新）"""
-        trade_date = trade_date or self.get_today()
-        
-        logger.info(f"[{self.TASK_NAME}] 增量采集: {trade_date}")
-        
-        try:
-            df = self.fetch_by_date(trade_date)
-            
-            if df.empty:
-                logger.info(f"[{self.TASK_NAME}] {trade_date} 无数据")
-                return {"success": 0, "failed": 0}
-            
-            result = self.save_data(df)
-            return result
-            
-        except Exception as e:
-            logger.error(f"[{self.TASK_NAME}] 增量采集失败: {e}")
-            self.record_failure(trade_date=trade_date, error=e)
+            logger.error(f"[{self.TASK_NAME}] 增量 {d} 失败: {e}")
+            self.record_failure(trade_date=d, error=e)
             return {"success": 0, "failed": 1}
 
 
 class StockBasedCollector(BaseCollector):
-    """
-    基于股票的采集器基类
-    适用于按股票代码逐个获取数据的场景
-    """
-    
+    """按个股代码取数（少用）。"""
+
     @abstractmethod
-    def fetch_by_stock(self, ts_code: str, start_date: str = None, 
-                       end_date: str = None) -> pd.DataFrame:
-        """
-        获取指定股票的数据
-        
-        Args:
-            ts_code: 股票代码
-            start_date: 开始日期
-            end_date: 结束日期
-            
-        Returns:
-            数据DataFrame
-        """
-        pass
-    
-    def collect_full(self, start_date: str = None, end_date: str = None) -> Dict:
-        """全量采集（按股票遍历）"""
+    def fetch_by_stock(self, ts_code: str, start_date: str = None,
+                       end_date: str = None) -> pd.DataFrame: ...
+
+    def run_full(self, start_date=None, end_date=None, _update=False) -> dict:
+        if not self.can_run():
+            return {"success": 0, "failed": 0, "skipped": True}
         start_date = start_date or settings.data.start_date
         end_date = end_date or self.get_today()
-        
-        logger.info(f"[{self.TASK_NAME}] 开始全量采集: {start_date} - {end_date}")
-        
-        # 创建任务
-        task_name = f"{self.TASK_NAME}_full_{start_date}_{end_date}"
-        
-        # 获取股票列表
-        stock_list = self.get_stock_list(include_delisted=settings.data.include_delisted)
-        if not stock_list:
-            logger.warning("未找到股票数据，请先同步股票列表")
+        codes = self.get_stock_codes()
+        if not codes:
+            logger.warning(f"[{self.TASK_NAME}] 无股票列表（请先同步 stock_basic）")
             return {"success": 0, "failed": 0}
-        
-        total_stocks = len(stock_list)
-        
-        # 检查断点续传
-        resume_point = self.task_manager.get_resume_point(task_name)
-        if resume_point["last_code"]:
-            # 从断点继续
+        total_s = total_f = 0
+        t0 = datetime.now()
+        for i, code in enumerate(codes):
             try:
-                idx = stock_list.index(resume_point["last_code"])
-                skipped_count = idx + 1
-                stock_list = stock_list[idx + 1:]
-                
-                logger.info("=" * 60)
-                logger.info(f"[{self.TASK_NAME}] ★★★ 检测到断点续传 ★★★")
-                logger.info(f"[{self.TASK_NAME}] 上次进度: 已处理到 {resume_point['last_code']}")
-                logger.info(f"[{self.TASK_NAME}] 已完成: {skipped_count} 只股票")
-                logger.info(f"[{self.TASK_NAME}] 剩余待处理: {len(stock_list)} 只股票")
-                logger.info(f"[{self.TASK_NAME}] 总计: {total_stocks} 只股票")
-                logger.info("=" * 60)
-            except ValueError:
-                logger.warning(f"[{self.TASK_NAME}] 断点股票 {resume_point['last_code']} 不在当前列表中，从头开始")
-        else:
-            logger.info("=" * 60)
-            logger.info(f"[{self.TASK_NAME}] 全新任务开始（无断点记录）")
-            logger.info(f"[{self.TASK_NAME}] 待处理: {len(stock_list)} 只股票")
-            logger.info("=" * 60)
-        
-        # 创建任务
-        self.task_manager.create_task(
-            task_name=task_name,
-            task_type=self.TASK_NAME,
-            total_items=len(stock_list),
-            metadata={"start_date": start_date, "end_date": end_date}
-        )
-        self.task_manager.start_task(task_name)
-        
-        total_success = 0
-        total_failed = 0
-        start_time = datetime.now()
-        
-        try:
-            for i, ts_code in enumerate(stock_list):
-                try:
-                    df = self.fetch_by_stock(ts_code, start_date, end_date)
-                    
-                    if not df.empty:
-                        result = self.save_data(df)
-                        total_success += result["success"]
-                        total_failed += result["failed"]
-                    
-                    # 更新进度
-                    self.task_manager.update_progress(
-                        task_name,
-                        increment_processed=1,
-                        last_processed_code=ts_code
-                    )
-                    
-                    if (i + 1) % 100 == 0:
-                        logger.info(f"[{self.TASK_NAME}] 进度: {i + 1}/{len(stock_list)}")
-                        
-                except Exception as e:
-                    logger.error(f"[{self.TASK_NAME}] 采集失败 {ts_code}: {e}")
-                    self.record_failure(ts_code=ts_code, error=e)
-                    total_failed += 1
-                    self.task_manager.update_progress(task_name, increment_failed=1)
-            
-            # 完成任务
-            self.task_manager.complete_task(task_name)
-            
-        except KeyboardInterrupt:
-            logger.info("用户中断，保存进度...")
-            self.task_manager.pause_task(task_name)
-            raise
-        except Exception as e:
-            logger.error(f"任务异常: {e}")
-            self.task_manager.complete_task(task_name, TaskStatus.FAILED)
-            raise
-        
-        duration = (datetime.now() - start_time).total_seconds()
-        
-        stats = {
-            "success": total_success,
-            "failed": total_failed,
-            "duration": duration
-        }
-        self.print_stats(stats)
-        
-        return stats
-    
-    def collect_incremental(self, trade_date: str = None) -> Dict:
-        """
-        增量采集
-        对于基于股票的采集器，增量采集通常是获取最新一天的数据
-        """
-        # 默认实现：遍历所有股票获取最新数据
-        # 子类可以覆盖此方法使用更高效的方式
-        trade_date = trade_date or self.get_today()
-        
-        logger.info(f"[{self.TASK_NAME}] 增量采集: {trade_date}")
-        
-        stock_list = self.get_stock_list(include_delisted=False)  # 增量只处理上市股票
-        
-        total_success = 0
-        total_failed = 0
-        
-        for ts_code in stock_list:
-            try:
-                df = self.fetch_by_stock(ts_code, trade_date, trade_date)
-                
-                if not df.empty:
-                    result = self.save_data(df)
-                    total_success += result["success"]
-                    
+                df = self.fetch_by_stock(code, start_date, end_date)
+                r = self.save(df, update_on_conflict=_update)
+                total_s += r["success"]
+            except KeyboardInterrupt:
+                logger.warning(f"[{self.TASK_NAME}] 用户中断于 {code}")
+                raise
             except Exception as e:
-                logger.error(f"[{self.TASK_NAME}] 增量采集失败 {ts_code}: {e}")
-                self.record_failure(ts_code=ts_code, trade_date=trade_date, error=e)
-                total_failed += 1
-        
-        return {"success": total_success, "failed": total_failed}
+                logger.error(f"[{self.TASK_NAME}] {code} 失败: {e}")
+                self.record_failure(ts_code=code, error=e)
+                total_f += 1
+            if (i + 1) % 100 == 0:
+                logger.info(f"[{self.TASK_NAME}] {i + 1}/{len(codes)}")
+        return {"success": total_s, "failed": total_f,
+                "duration": (datetime.now() - t0).total_seconds()}
+
+    def run_incremental(self, trade_date=None, _update=False) -> dict:
+        if not self.can_run():
+            return {"success": 0, "failed": 0, "skipped": True}
+        d = trade_date or self.get_today()
+        codes = self.get_stock_codes(only_listed=True)
+        total_s = total_f = 0
+        for code in codes:
+            try:
+                df = self.fetch_by_stock(code, d, d)
+                r = self.save(df, update_on_conflict=_update)
+                total_s += r["success"]
+            except Exception as e:
+                logger.error(f"[{self.TASK_NAME}] 增量 {code} 失败: {e}")
+                self.record_failure(ts_code=code, trade_date=d, error=e)
+                total_f += 1
+        return {"success": total_s, "failed": total_f}
+
+
+class PeriodBasedCollector(BaseCollector):
+    """按财报报告期取数（fina_indicator、forecast、express）。"""
+
+    @abstractmethod
+    def fetch_by_period(self, period: str) -> pd.DataFrame: ...
+
+    def gen_periods(self, start_date, end_date) -> list:
+        sy, ey = int(start_date[:4]), int(end_date[:4])
+        out = []
+        for y in range(sy, ey + 1):
+            for q in ("0331", "0630", "0930", "1231"):
+                p = f"{y}{q}"
+                if start_date <= p <= end_date:
+                    out.append(p)
+        return sorted(out)
+
+    def run_full(self, start_date=None, end_date=None, _update=False) -> dict:
+        if not self.can_run():
+            return {"success": 0, "failed": 0, "skipped": True}
+        start_date = start_date or settings.data.start_date
+        end_date = end_date or self.get_today()
+        periods = self.gen_periods(start_date, end_date)
+        total_s = total_f = 0
+        t0 = datetime.now()
+        for p in periods:
+            try:
+                df = self.fetch_by_period(p)
+                r = self.save(df, update_on_conflict=_update)
+                total_s += r["success"]
+            except KeyboardInterrupt:
+                logger.warning(f"[{self.TASK_NAME}] 用户中断于报告期 {p}")
+                raise
+            except Exception as e:
+                logger.error(f"[{self.TASK_NAME}] 报告期 {p} 失败: {e}")
+                self.record_failure(trade_date=p, error=e)
+                total_f += 1
+        return {"success": total_s, "failed": total_f,
+                "duration": (datetime.now() - t0).total_seconds()}
+
+    def run_incremental(self, trade_date=None, _update=False) -> dict:
+        if not self.can_run():
+            return {"success": 0, "failed": 0, "skipped": True}
+        # 若传入的是单个报告期（retry 场景），直接采该报告期
+        if trade_date and len(str(trade_date)) == 8 and str(trade_date).endswith(
+                ("0331", "0630", "0930", "1231")):
+            periods = [trade_date]
+        else:
+            periods = self._recent_periods(n=2)
+        total_s = total_f = 0
+        for p in periods:
+            try:
+                r = self.save(self.fetch_by_period(p), update_on_conflict=_update)
+                total_s += r["success"]
+            except Exception as e:
+                logger.error(f"[{self.TASK_NAME}] 增量报告期 {p} 失败: {e}")
+                self.record_failure(trade_date=p, error=e)
+                total_f += 1
+        return {"success": total_s, "failed": total_f}
+
+    def _recent_periods(self, n=2) -> list:
+        today = datetime.now()
+        y, m = today.year, today.month
+        latest = (f"{y}0930" if m >= 10 else f"{y}0630" if m >= 7
+                  else f"{y}0331" if m >= 4 else f"{y - 1}1231")
+        allp = self.gen_periods(f"{y - 2}0101", f"{y}1231")
+        try:
+            i = allp.index(latest)
+            return allp[max(0, i - n + 1):i + 1]
+        except ValueError:
+            return allp[-n:]
+
+
+class SnapshotCollector(BaseCollector):
+    """全量快照类（stock_basic、trade_calendar、dc_member）。"""
+
+    @abstractmethod
+    def fetch_snapshot(self, **kwargs) -> pd.DataFrame: ...
+
+    def run_full(self, start_date=None, end_date=None, _update=False) -> dict:
+        if not self.can_run():
+            return {"success": 0, "failed": 0, "skipped": True}
+        try:
+            df = self.fetch_snapshot(start_date=start_date, end_date=end_date)
+            # 快照默认覆盖写，保证最新
+            return self.save(df, update_on_conflict=True)
+        except Exception as e:
+            logger.error(f"[{self.TASK_NAME}] 快照采集失败: {e}")
+            self.record_failure(error=e)
+            return {"success": 0, "failed": 1}
+
+    def run_incremental(self, trade_date=None, _update=False) -> dict:
+        return self.run_full()

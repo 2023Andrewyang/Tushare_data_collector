@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
-"""
-Tushare Token 配置文件
-"""
-from dotenv import load_dotenv
-from pathlib import Path
-import os
-env_path = Path(__file__).resolve().parent.parent / '.env'
-load_dotenv(env_path)
-TUSHARE_TOKEN = os.getenv("TUSHARE_TOKEN")
+"""Tushare Token（向后兼容）：统一从 settings 读取。
 
+新代码请直接使用 `settings.tushare.token` / `settings.tushare.points`。
+保留本模块仅为兼容旧的 `from config.tushare_token import TUSHARE_TOKEN` 引用。
+"""
+from config.settings import settings
+
+TUSHARE_TOKEN = settings.tushare.token
+TUSHARE_POINTS = settings.tushare.points

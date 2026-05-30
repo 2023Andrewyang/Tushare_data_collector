@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
-"""
-核心模块
-"""
-from .database import MongoDBManager
-from .tushare_client import TushareClient
-from .task_manager import TaskManager
-from .failure_handler import FailureHandler
+"""核心模块。"""
+from core.database import PostgresManager, get_db_manager
+from core.tushare_client import TushareClient, get_tushare_client
+from core.failure_handler import FailureHandler, get_failure_handler
 
-__all__ = ['MongoDBManager', 'TushareClient', 'TaskManager', 'FailureHandler']
-
+__all__ = [
+    "PostgresManager", "get_db_manager",
+    "TushareClient", "get_tushare_client",
+    "FailureHandler", "get_failure_handler",
+]
