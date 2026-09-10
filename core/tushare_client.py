@@ -60,6 +60,10 @@ class TushareClient:
             raise ValueError("未配置 TUSHARE_TOKEN，请在 .env 中设置")
         ts.set_token(token)
         self._pro = ts.pro_api()
+        if settings.tushare.api_url:
+            # Tushare 1.4.x 未公开自定义 endpoint 参数，兼容服务需覆盖 SDK 私有属性。
+            self._pro._DataApi__http_url = settings.tushare.api_url.rstrip("/")
+            logger.info("Tushare 客户端使用自定义 API 地址: %s", settings.tushare.api_url)
         self._limiter = RateLimiter(
             settings.tushare.requests_per_second,
             int(settings.tushare.requests_per_second * 2))

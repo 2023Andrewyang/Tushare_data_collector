@@ -63,6 +63,8 @@ psql -U postgres -f scripts/setup_db.sql
 
 ```ini
 TUSHARE_TOKEN=你的Token
+# 留空使用官方 Tushare；临时切换到兼容服务时填写其 DataApi 根地址
+TUSHARE_API_URL=
 TUSHARE_POINTS=5000          # >=6000 才采集东财板块接口
 
 DB_HOST=localhost

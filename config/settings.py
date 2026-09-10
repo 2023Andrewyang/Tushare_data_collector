@@ -71,6 +71,8 @@ class PostgresConfig:
 class TushareConfig:
     """Tushare API 配置。"""
     token: str = field(default_factory=lambda: _strip_inline_comment(os.getenv("TUSHARE_TOKEN", "")))
+    # 留空时由 Tushare SDK 使用官方地址；填写兼容服务的 DataApi 根地址可临时切换。
+    api_url: str = field(default_factory=lambda: _strip_inline_comment(os.getenv("TUSHARE_API_URL", "")))
     points: int = field(default_factory=lambda: _get_int("TUSHARE_POINTS", 5000))  # ★积分门控
     requests_per_minute: int = field(default_factory=lambda: _get_int("REQ_PER_MIN", 480))
     requests_per_second: float = field(default_factory=lambda: _get_float("REQ_PER_SEC", 8.0))
