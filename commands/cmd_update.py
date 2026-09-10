@@ -5,6 +5,7 @@ import logging
 from config.settings import settings
 from core.database import get_db_manager
 from core.failure_handler import get_failure_handler
+from core.progress import ProgressReporter
 from collectors import COLLECTOR_REGISTRY
 from commands import LOW_FREQ
 from commands._common import print_summary
@@ -84,11 +85,15 @@ def run(args):
         daily_names = [n for n in COLLECTOR_REGISTRY if n not in LOW_FREQ]
 
     results = {}
+    progress_by_module = {
+        name: ProgressReporter(logger, name, len(trade_dates), "日期")
+        for name in daily_names
+    }
     for d in trade_dates:
         logger.info(f"=== update {d} ===")
         for name in daily_names:
             Coll = COLLECTOR_REGISTRY[name]
-            r = Coll().run_incremental(d)
+            r = Coll().run_incremental(d, _progress=progress_by_module[name])
             prev = results.get(name, {"success": 0, "failed": 0})
             results[name] = {
                 "success": prev.get("success", 0) + r.get("success", 0),

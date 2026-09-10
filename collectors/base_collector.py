@@ -20,6 +20,7 @@ from config.settings import settings
 from core.database import get_db_manager
 from core.tushare_client import get_tushare_client
 from core.failure_handler import get_failure_handler
+from core.progress import ProgressReporter
 from models.schema import TABLES
 
 logger = logging.getLogger(__name__)
@@ -143,7 +144,9 @@ class DateBasedCollector(BaseCollector):
             return {"success": 0, "failed": 0}
         total_s = total_f = 0
         t0 = datetime.now()
-        for i, d in enumerate(dates):
+        progress = ProgressReporter(logger, self.TASK_NAME, len(dates), "日期")
+        for d in dates:
+            progress.start(d)
             try:
                 df = self.fetch_by_date(d)
                 r = self.save(df, update_on_conflict=_update)
@@ -155,22 +158,27 @@ class DateBasedCollector(BaseCollector):
                 logger.error(f"[{self.TASK_NAME}] {d} 失败: {e}")
                 self.record_failure(trade_date=d, error=e)
                 total_f += 1
-            if (i + 1) % 50 == 0:
-                logger.info(f"[{self.TASK_NAME}] {i + 1}/{len(dates)}")
+            progress.advance()
         return {"success": total_s, "failed": total_f,
                 "duration": (datetime.now() - t0).total_seconds()}
 
-    def run_incremental(self, trade_date=None, _update=False) -> dict:
-        if not self.can_run():
-            return {"success": 0, "failed": 0, "skipped": True}
+    def run_incremental(self, trade_date=None, _update=False, _progress=None) -> dict:
         d = trade_date or self.get_today()
+        progress = _progress or ProgressReporter(logger, self.TASK_NAME, 1, "日期")
+        if not self.can_run():
+            progress.start(d)
+            progress.advance()
+            return {"success": 0, "failed": 0, "skipped": True}
+        progress.start(d)
         try:
             df = self.fetch_by_date(d)
-            return self.save(df, update_on_conflict=_update)
+            result = self.save(df, update_on_conflict=_update)
         except Exception as e:
             logger.error(f"[{self.TASK_NAME}] 增量 {d} 失败: {e}")
             self.record_failure(trade_date=d, error=e)
-            return {"success": 0, "failed": 1}
+            result = {"success": 0, "failed": 1}
+        progress.advance()
+        return result
 
 
 class StockBasedCollector(BaseCollector):
@@ -191,7 +199,10 @@ class StockBasedCollector(BaseCollector):
             return {"success": 0, "failed": 0}
         total_s = total_f = 0
         t0 = datetime.now()
-        for i, code in enumerate(codes):
+        progress = ProgressReporter(
+            logger, self.TASK_NAME, len(codes), f"股票（日期范围 {start_date}~{end_date}）")
+        for code in codes:
+            progress.start(code)
             try:
                 df = self.fetch_by_stock(code, start_date, end_date)
                 r = self.save(df, update_on_conflict=_update)
@@ -203,8 +214,7 @@ class StockBasedCollector(BaseCollector):
                 logger.error(f"[{self.TASK_NAME}] {code} 失败: {e}")
                 self.record_failure(ts_code=code, error=e)
                 total_f += 1
-            if (i + 1) % 100 == 0:
-                logger.info(f"[{self.TASK_NAME}] {i + 1}/{len(codes)}")
+            progress.advance()
         return {"success": total_s, "failed": total_f,
                 "duration": (datetime.now() - t0).total_seconds()}
 
@@ -214,7 +224,9 @@ class StockBasedCollector(BaseCollector):
         d = trade_date or self.get_today()
         codes = self.get_stock_codes(only_listed=True)
         total_s = total_f = 0
+        progress = ProgressReporter(logger, self.TASK_NAME, len(codes), f"股票（日期 {d}）")
         for code in codes:
+            progress.start(code)
             try:
                 df = self.fetch_by_stock(code, d, d)
                 r = self.save(df, update_on_conflict=_update)
@@ -223,6 +235,7 @@ class StockBasedCollector(BaseCollector):
                 logger.error(f"[{self.TASK_NAME}] 增量 {code} 失败: {e}")
                 self.record_failure(ts_code=code, trade_date=d, error=e)
                 total_f += 1
+            progress.advance()
         return {"success": total_s, "failed": total_f}
 
 
@@ -250,7 +263,9 @@ class PeriodBasedCollector(BaseCollector):
         periods = self.gen_periods(start_date, end_date)
         total_s = total_f = 0
         t0 = datetime.now()
+        progress = ProgressReporter(logger, self.TASK_NAME, len(periods), "报告期")
         for p in periods:
+            progress.start(p)
             try:
                 df = self.fetch_by_period(p)
                 r = self.save(df, update_on_conflict=_update)
@@ -262,6 +277,7 @@ class PeriodBasedCollector(BaseCollector):
                 logger.error(f"[{self.TASK_NAME}] 报告期 {p} 失败: {e}")
                 self.record_failure(trade_date=p, error=e)
                 total_f += 1
+            progress.advance()
         return {"success": total_s, "failed": total_f,
                 "duration": (datetime.now() - t0).total_seconds()}
 
@@ -275,7 +291,9 @@ class PeriodBasedCollector(BaseCollector):
         else:
             periods = self._recent_periods(n=2)
         total_s = total_f = 0
+        progress = ProgressReporter(logger, self.TASK_NAME, len(periods), "报告期")
         for p in periods:
+            progress.start(p)
             try:
                 r = self.save(self.fetch_by_period(p), update_on_conflict=_update)
                 total_s += r["success"]
@@ -283,6 +301,7 @@ class PeriodBasedCollector(BaseCollector):
                 logger.error(f"[{self.TASK_NAME}] 增量报告期 {p} 失败: {e}")
                 self.record_failure(trade_date=p, error=e)
                 total_f += 1
+            progress.advance()
         return {"success": total_s, "failed": total_f}
 
     def _recent_periods(self, n=2) -> list:
@@ -307,14 +326,18 @@ class SnapshotCollector(BaseCollector):
     def run_full(self, start_date=None, end_date=None, _update=False) -> dict:
         if not self.can_run():
             return {"success": 0, "failed": 0, "skipped": True}
+        progress = ProgressReporter(logger, self.TASK_NAME, 1, "任务范围")
+        progress.start(f"{start_date or '-'}~{end_date or '-'}")
         try:
             df = self.fetch_snapshot(start_date=start_date, end_date=end_date)
             # 快照默认覆盖写，保证最新
-            return self.save(df, update_on_conflict=True)
+            result = self.save(df, update_on_conflict=True)
         except Exception as e:
             logger.error(f"[{self.TASK_NAME}] 快照采集失败: {e}")
             self.record_failure(error=e)
-            return {"success": 0, "failed": 1}
+            result = {"success": 0, "failed": 1}
+        progress.advance()
+        return result
 
     def run_incremental(self, trade_date=None, _update=False) -> dict:
         return self.run_full()
