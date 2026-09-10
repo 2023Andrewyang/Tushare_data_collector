@@ -7,7 +7,7 @@
 - 每张行情表都对 trade_date 建索引。
 """
 from sqlalchemy import (MetaData, Table, Column, String, Float, Integer,
-                        Numeric, Text, DateTime, Index, func)
+                        Numeric, Text, DateTime, Index, UniqueConstraint, func)
 
 metadata = MetaData()
 
@@ -378,6 +378,28 @@ task_failure_log = Table(
 )
 Index("idx_failure_status", task_failure_log.c.status)
 Index("idx_failure_collector", task_failure_log.c.collector, task_failure_log.c.status)
+
+# 采集工作项成功状态：用于在中断后跳过已完整写入的数据请求。
+collection_checkpoint = Table(
+    "collection_checkpoint", metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("collector", String(40), nullable=False),
+    Column("item_type", String(16), nullable=False),
+    Column("item_key", String(255), nullable=False),
+    Column("status", String(16), nullable=False, server_default="pending"),
+    Column("attempt_count", Integer, nullable=False, server_default="0"),
+    Column("received_rows", Integer),
+    Column("affected_rows", Integer),
+    Column("last_error", Text),
+    Column("started_at", DateTime),
+    Column("completed_at", DateTime),
+    Column("created_at", DateTime, server_default=func.now()),
+    Column("updated_at", DateTime, server_default=func.now()),
+    UniqueConstraint("collector", "item_type", "item_key",
+                     name="uq_collection_checkpoint_item"),
+)
+Index("idx_checkpoint_collector_status", collection_checkpoint.c.collector,
+      collection_checkpoint.c.status)
 
 # ============ 注册表 ============
 TABLES = {t.name: t for t in metadata.tables.values()}

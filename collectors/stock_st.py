@@ -25,10 +25,10 @@ class StockSTCollector(DateBasedCollector):
     def fetch_by_date(self, trade_date: str) -> pd.DataFrame:
         return self.client.query("stock_st", trade_date=trade_date, fields=_FIELDS)
 
-    def run_full(self, start_date=None, end_date=None, _update=False) -> dict:
+    def run_full(self, start_date=None, end_date=None, _update=False, _force=False) -> dict:
         # ST 数据从 2016 年开始，早于此日期无数据
         if start_date is None or start_date < self.DATA_START_DATE:
             start_date = self.DATA_START_DATE
             logger.info(f"[{self.TASK_NAME}] ST 数据从 2016 年开始，"
                         f"调整起始日期为 {start_date}")
-        return super().run_full(start_date, end_date, _update=_update)
+        return super().run_full(start_date, end_date, _update=_update, _force=_force)

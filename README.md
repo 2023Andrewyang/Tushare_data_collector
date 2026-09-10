@@ -5,13 +5,15 @@
 ## 功能特性
 
 - **统一 CLI 入口**：`python main.py {init|update|retry|backfill|status}`，无定时任务，手动触发。
-- **幂等写入**：基于主键 `ON CONFLICT DO NOTHING`，自动跳过重复数据，无需断点续传。
+- **行级幂等写入**：基于主键 `ON CONFLICT DO NOTHING`，重复写入不会产生重复数据。
+- **持久化断点续传**：每个日期、股票、报告期或快照工作项都会记录状态；中断后重跑时，已成功项会跳过且不会再次请求 Tushare。
+- **实时进度与 ETA**：日志展示当前模块、当前日期/工作项、`0.00%` 至 `100.00%` 的完成比例和预估剩余时间。
 - **失败记录与一键重试**：采集失败写入 `task_failure_log`，Token 恢复后 `retry` 一键重跑。
 - **积分门控**：`.env` 中 `TUSHARE_POINTS` 控制高分接口是否采集，积分不足自动跳过、不报错。
 - **低频接口自动检测**：日历、股票列表、板块成分股、财务数据在 `update` 时按规则判断是否需要更新。
 - **非交易日跳过**：`update` 按日历逐日执行，非交易日自动跳过。
 
-## 数据表清单（21 张业务表 + 1 张系统表）
+## 数据表清单（21 张业务表 + 2 张系统表）
 
 | 类别 | 表 |
 |------|----|
@@ -21,7 +23,7 @@
 | 资金 | `moneyflow`、`moneyflow_hsgt` |
 | 市场行为 | `limit_list`、`top_list`、`top_inst`、`block_trade`、`margin_summary` |
 | 财务 | `fina_indicator`、`forecast`、`express` |
-| 系统 | `task_failure_log` |
+| 系统 | `task_failure_log`、`collection_checkpoint` |
 
 > 注意：`stk_limit`（涨跌停"价格"）与 `limit_list`（涨跌停"列表/名单"）是两个不同的接口与表。
 
@@ -94,26 +96,48 @@ python main.py init --start 20200101 --end 20260530
 python main.py init --collector daily_quote --start 20240102 --end 20240102
 ```
 
+> 首次执行采集器时，程序也会自动创建 `collection_checkpoint` 表，以兼容已有数据库。
+
 ## 命令用法
 
 ```bash
-# 初始化（建表 + 全量采集）
+# 初始化（建表 + 全量采集；默认跳过已成功工作项）
 python main.py init [--start YYYYMMDD] [--end YYYYMMDD] [--schema-only] [--collector X]
 
-# 增量更新（日频逐日 + 低频自动检测）
+# 增量更新（日频逐日 + 低频自动检测；默认跳过已成功工作项）
 python main.py update [--date YYYYMMDD] [--start YYYYMMDD --end YYYYMMDD] [--collector X]
 
 # 重试失败任务（Token 恢复后直接跑此命令）
 python main.py retry [--collector X] [--date D] [--start --end]
 
-# 强制补录（覆盖写，用于数据修复）
+# 强制补录（默认重新请求并覆盖写，用于数据修复）
 python main.py backfill --start YYYYMMDD --end YYYYMMDD [--collector X]
+
+# 恢复被中断的补录：跳过该范围中已成功的工作项
+python main.py backfill --start YYYYMMDD --end YYYYMMDD [--collector X] --resume
 
 # 查看状态
 python main.py status                 # 各表行数 + 最新日期
 python main.py status --date 20260530 # 当日各接口记录数（对比阈值）
 python main.py status --failures      # 失败任务汇总
 ```
+
+## 进度日志与断点续传
+
+每个采集工作项都会记录在 `collection_checkpoint`：成功为 `succeeded`，普通异常为 `failed`，按 **Ctrl+C** 中断时为 `interrupted`。业务数据写入和将工作项标记为成功在同一个数据库事务中完成，因此只有完整落库的工作项才会在后续运行时跳过。
+
+运行日志示例：
+
+```text
+[进度] 模块=daily_quote | 当前日期=20240910 | 进度=37.50% (15/40) | 预计剩余=00:02:18
+[daily_quote] date=20240909 已完成，断点续传跳过
+```
+
+- 首个工作项完成前，ETA 显示为“计算中”；之后按当前模块已完成工作项的平均耗时估算。
+- 进度按工作项计数，而不是按写入行数计数；合法的空数据响应同样会被标记为完成，避免重复请求。
+- `init` 和 `update` 默认启用断点续传。中断后直接使用相同参数重新运行即可。
+- `backfill` 默认保持“强制补录”语义，会重新请求并覆盖写；只有显式传入 `--resume` 时才跳过已完成项。
+- 已成功的工作项仍由业务表的主键幂等性兜底；checkpoint 用于避免重复网络请求，二者互补。
 
 ## 积分门控（TUSHARE_POINTS）
 
@@ -134,10 +158,12 @@ Tushare_Data/
 ├── main.py                  # CLI 统一入口
 ├── config/settings.py       # 配置 + 表名常量
 ├── core/
+│   ├── checkpoint.py        # 工作项状态与断点续传
 │   ├── database.py          # PostgresManager（SQLAlchemy Core）
 │   ├── tushare_client.py    # Tushare 客户端（限频 + 重试）
 │   ├── failure_handler.py   # 失败记录与重试
-│   └── logging_setup.py     # 日志（按日期滚动）
+│   ├── logging_setup.py     # 日志（按日期滚动）
+│   └── progress.py          # 模块进度与 ETA 日志
 ├── models/schema.py         # 全部表定义（DDL 唯一真源）
 ├── collectors/              # 21 个采集器 + 注册表
 ├── scheduler/update_checker.py  # 低频接口更新检测
@@ -172,7 +198,9 @@ pytest -m "integration" -q
 
 **Token 失效导致大量失败**：换好 Token 后运行 `python main.py retry`，自动重跑所有 pending 失败任务。
 
-**幂等说明**：重复采集同一天数据不会产生重复行（主键冲突跳过）；如需覆盖更新用 `backfill`。
+**采集被 Ctrl+C 中断**：无需从头重复请求。对 `init` 或 `update`，使用相同参数再次执行即可跳过已成功工作项并继续未完成项。对于强制补录，重新运行时加 `--resume`。
+
+**幂等与断点续传的区别**：幂等写入保证重复数据行不会被插入；断点续传通过 `collection_checkpoint` 跳过已成功工作项，从而避免重复发起 API 请求。若需要强制重新拉取并覆盖数据，请使用不带 `--resume` 的 `backfill`。
 
 ## License
 

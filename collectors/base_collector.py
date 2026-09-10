@@ -20,6 +20,7 @@ from config.settings import settings
 from core.database import get_db_manager
 from core.tushare_client import get_tushare_client
 from core.failure_handler import get_failure_handler
+from core.checkpoint import get_checkpoint_manager
 from core.progress import ProgressReporter
 from models.schema import TABLES
 
@@ -41,6 +42,7 @@ class BaseCollector(ABC):
         self.db = get_db_manager()
         self.client = get_tushare_client()
         self.failure = get_failure_handler()
+        self.checkpoints = get_checkpoint_manager()
         if not self.TASK_NAME or not self.TABLE_NAME:
             raise ValueError(f"{type(self).__name__} 未设置 TASK_NAME/TABLE_NAME")
 
@@ -82,15 +84,28 @@ class BaseCollector(ABC):
 
     # ---------- 写入 ----------
     def save(self, df: pd.DataFrame, update_on_conflict: bool = False,
-             table_name: str = None, key_fields: list = None) -> dict:
+             table_name: str = None, key_fields: list = None,
+             checkpoint=None) -> dict:
         df = self.align_columns(df, table_name)
-        if df.empty:
+        rows = df.to_dict("records") if not df.empty else []
+        target_table = table_name or self.TABLE_NAME
+        target_keys = key_fields or self.KEY_FIELDS
+        if checkpoint:
+            r = self.db.bulk_upsert_and_complete_checkpoint(
+                target_table, rows, target_keys, checkpoint["id"], update_on_conflict)
+        elif not rows:
             return {"success": 0, "failed": 0}
-        rows = df.to_dict("records")
-        r = self.db.bulk_upsert(table_name or self.TABLE_NAME, rows,
-                                key_fields or self.KEY_FIELDS, update_on_conflict)
+        else:
+            r = self.db.bulk_upsert(target_table, rows, target_keys, update_on_conflict)
         logger.info(f"[{self.TASK_NAME}] 写入 {r['affected']}/{r['received']}")
         return {"success": r["affected"], "failed": 0}
+
+    def claim_work(self, item_type: str, item_key: str, force: bool = False):
+        """领取尚未成功的工作项；返回 None 表示可安全跳过。"""
+        checkpoint = self.checkpoints.claim(self.TASK_NAME, item_type, item_key, force)
+        if checkpoint is None:
+            logger.info(f"[{self.TASK_NAME}] {item_type}={item_key} 已完成，断点续传跳过")
+        return checkpoint
 
     # ---------- 失败 ----------
     def record_failure(self, trade_date=None, ts_code=None, error=None, context=None):
@@ -122,9 +137,9 @@ class BaseCollector(ABC):
     @abstractmethod
     def run_incremental(self, trade_date=None) -> dict: ...
 
-    def run_backfill(self, start_date, end_date) -> dict:
-        """默认：等同 run_full 但强制覆盖写。子类一般无需重写。"""
-        return self.run_full(start_date, end_date, _update=True)
+    def run_backfill(self, start_date, end_date, resume: bool = False) -> dict:
+        """强制补录；传入 resume 时跳过本范围内已完成的工作项。"""
+        return self.run_full(start_date, end_date, _update=True, _force=not resume)
 
 
 class DateBasedCollector(BaseCollector):
@@ -133,7 +148,7 @@ class DateBasedCollector(BaseCollector):
     @abstractmethod
     def fetch_by_date(self, trade_date: str) -> pd.DataFrame: ...
 
-    def run_full(self, start_date=None, end_date=None, _update=False) -> dict:
+    def run_full(self, start_date=None, end_date=None, _update=False, _force=False) -> dict:
         if not self.can_run():
             return {"success": 0, "failed": 0, "skipped": True}
         start_date = start_date or settings.data.start_date
@@ -147,14 +162,20 @@ class DateBasedCollector(BaseCollector):
         progress = ProgressReporter(logger, self.TASK_NAME, len(dates), "日期")
         for d in dates:
             progress.start(d)
+            checkpoint = self.claim_work("date", d, force=_force)
+            if checkpoint is None:
+                progress.advance()
+                continue
             try:
                 df = self.fetch_by_date(d)
-                r = self.save(df, update_on_conflict=_update)
+                r = self.save(df, update_on_conflict=_update, checkpoint=checkpoint)
                 total_s += r["success"]
             except KeyboardInterrupt:
+                self.checkpoints.mark_interrupted(checkpoint["id"])
                 logger.warning(f"[{self.TASK_NAME}] 用户中断于 {d}")
                 raise
             except Exception as e:
+                self.checkpoints.mark_failed(checkpoint["id"], e)
                 logger.error(f"[{self.TASK_NAME}] {d} 失败: {e}")
                 self.record_failure(trade_date=d, error=e)
                 total_f += 1
@@ -162,7 +183,8 @@ class DateBasedCollector(BaseCollector):
         return {"success": total_s, "failed": total_f,
                 "duration": (datetime.now() - t0).total_seconds()}
 
-    def run_incremental(self, trade_date=None, _update=False, _progress=None) -> dict:
+    def run_incremental(self, trade_date=None, _update=False, _progress=None,
+                        _force=False) -> dict:
         d = trade_date or self.get_today()
         progress = _progress or ProgressReporter(logger, self.TASK_NAME, 1, "日期")
         if not self.can_run():
@@ -170,10 +192,19 @@ class DateBasedCollector(BaseCollector):
             progress.advance()
             return {"success": 0, "failed": 0, "skipped": True}
         progress.start(d)
+        checkpoint = self.claim_work("date", d, force=_force)
+        if checkpoint is None:
+            progress.advance()
+            return {"success": 0, "failed": 0, "skipped": True}
         try:
             df = self.fetch_by_date(d)
-            result = self.save(df, update_on_conflict=_update)
+            result = self.save(df, update_on_conflict=_update, checkpoint=checkpoint)
+        except KeyboardInterrupt:
+            self.checkpoints.mark_interrupted(checkpoint["id"])
+            logger.warning(f"[{self.TASK_NAME}] 用户中断于 {d}")
+            raise
         except Exception as e:
+            self.checkpoints.mark_failed(checkpoint["id"], e)
             logger.error(f"[{self.TASK_NAME}] 增量 {d} 失败: {e}")
             self.record_failure(trade_date=d, error=e)
             result = {"success": 0, "failed": 1}
@@ -188,7 +219,7 @@ class StockBasedCollector(BaseCollector):
     def fetch_by_stock(self, ts_code: str, start_date: str = None,
                        end_date: str = None) -> pd.DataFrame: ...
 
-    def run_full(self, start_date=None, end_date=None, _update=False) -> dict:
+    def run_full(self, start_date=None, end_date=None, _update=False, _force=False) -> dict:
         if not self.can_run():
             return {"success": 0, "failed": 0, "skipped": True}
         start_date = start_date or settings.data.start_date
@@ -203,14 +234,21 @@ class StockBasedCollector(BaseCollector):
             logger, self.TASK_NAME, len(codes), f"股票（日期范围 {start_date}~{end_date}）")
         for code in codes:
             progress.start(code)
+            checkpoint = self.claim_work("stock", f"{code}:{start_date}:{end_date}",
+                                         force=_force)
+            if checkpoint is None:
+                progress.advance()
+                continue
             try:
                 df = self.fetch_by_stock(code, start_date, end_date)
-                r = self.save(df, update_on_conflict=_update)
+                r = self.save(df, update_on_conflict=_update, checkpoint=checkpoint)
                 total_s += r["success"]
             except KeyboardInterrupt:
+                self.checkpoints.mark_interrupted(checkpoint["id"])
                 logger.warning(f"[{self.TASK_NAME}] 用户中断于 {code}")
                 raise
             except Exception as e:
+                self.checkpoints.mark_failed(checkpoint["id"], e)
                 logger.error(f"[{self.TASK_NAME}] {code} 失败: {e}")
                 self.record_failure(ts_code=code, error=e)
                 total_f += 1
@@ -218,7 +256,7 @@ class StockBasedCollector(BaseCollector):
         return {"success": total_s, "failed": total_f,
                 "duration": (datetime.now() - t0).total_seconds()}
 
-    def run_incremental(self, trade_date=None, _update=False) -> dict:
+    def run_incremental(self, trade_date=None, _update=False, _force=False) -> dict:
         if not self.can_run():
             return {"success": 0, "failed": 0, "skipped": True}
         d = trade_date or self.get_today()
@@ -227,11 +265,20 @@ class StockBasedCollector(BaseCollector):
         progress = ProgressReporter(logger, self.TASK_NAME, len(codes), f"股票（日期 {d}）")
         for code in codes:
             progress.start(code)
+            checkpoint = self.claim_work("stock", f"{code}:{d}:{d}", force=_force)
+            if checkpoint is None:
+                progress.advance()
+                continue
             try:
                 df = self.fetch_by_stock(code, d, d)
-                r = self.save(df, update_on_conflict=_update)
+                r = self.save(df, update_on_conflict=_update, checkpoint=checkpoint)
                 total_s += r["success"]
+            except KeyboardInterrupt:
+                self.checkpoints.mark_interrupted(checkpoint["id"])
+                logger.warning(f"[{self.TASK_NAME}] 用户中断于 {code}")
+                raise
             except Exception as e:
+                self.checkpoints.mark_failed(checkpoint["id"], e)
                 logger.error(f"[{self.TASK_NAME}] 增量 {code} 失败: {e}")
                 self.record_failure(ts_code=code, trade_date=d, error=e)
                 total_f += 1
@@ -255,7 +302,7 @@ class PeriodBasedCollector(BaseCollector):
                     out.append(p)
         return sorted(out)
 
-    def run_full(self, start_date=None, end_date=None, _update=False) -> dict:
+    def run_full(self, start_date=None, end_date=None, _update=False, _force=False) -> dict:
         if not self.can_run():
             return {"success": 0, "failed": 0, "skipped": True}
         start_date = start_date or settings.data.start_date
@@ -266,14 +313,20 @@ class PeriodBasedCollector(BaseCollector):
         progress = ProgressReporter(logger, self.TASK_NAME, len(periods), "报告期")
         for p in periods:
             progress.start(p)
+            checkpoint = self.claim_work("period", p, force=_force)
+            if checkpoint is None:
+                progress.advance()
+                continue
             try:
                 df = self.fetch_by_period(p)
-                r = self.save(df, update_on_conflict=_update)
+                r = self.save(df, update_on_conflict=_update, checkpoint=checkpoint)
                 total_s += r["success"]
             except KeyboardInterrupt:
+                self.checkpoints.mark_interrupted(checkpoint["id"])
                 logger.warning(f"[{self.TASK_NAME}] 用户中断于报告期 {p}")
                 raise
             except Exception as e:
+                self.checkpoints.mark_failed(checkpoint["id"], e)
                 logger.error(f"[{self.TASK_NAME}] 报告期 {p} 失败: {e}")
                 self.record_failure(trade_date=p, error=e)
                 total_f += 1
@@ -294,10 +347,20 @@ class PeriodBasedCollector(BaseCollector):
         progress = ProgressReporter(logger, self.TASK_NAME, len(periods), "报告期")
         for p in periods:
             progress.start(p)
+            checkpoint = self.claim_work("period", p)
+            if checkpoint is None:
+                progress.advance()
+                continue
             try:
-                r = self.save(self.fetch_by_period(p), update_on_conflict=_update)
+                r = self.save(self.fetch_by_period(p), update_on_conflict=_update,
+                              checkpoint=checkpoint)
                 total_s += r["success"]
+            except KeyboardInterrupt:
+                self.checkpoints.mark_interrupted(checkpoint["id"])
+                logger.warning(f"[{self.TASK_NAME}] 用户中断于报告期 {p}")
+                raise
             except Exception as e:
+                self.checkpoints.mark_failed(checkpoint["id"], e)
                 logger.error(f"[{self.TASK_NAME}] 增量报告期 {p} 失败: {e}")
                 self.record_failure(trade_date=p, error=e)
                 total_f += 1
@@ -323,16 +386,27 @@ class SnapshotCollector(BaseCollector):
     @abstractmethod
     def fetch_snapshot(self, **kwargs) -> pd.DataFrame: ...
 
-    def run_full(self, start_date=None, end_date=None, _update=False) -> dict:
+    def run_full(self, start_date=None, end_date=None, _update=False, _force=False) -> dict:
         if not self.can_run():
             return {"success": 0, "failed": 0, "skipped": True}
+        scope = f"{start_date or '-'}~{end_date or '-'}"
         progress = ProgressReporter(logger, self.TASK_NAME, 1, "任务范围")
-        progress.start(f"{start_date or '-'}~{end_date or '-'}")
+        progress.start(scope)
+        checkpoint = self.claim_work("snapshot", f"{self.get_today()}:{scope}",
+                                     force=_force)
+        if checkpoint is None:
+            progress.advance()
+            return {"success": 0, "failed": 0, "skipped": True}
         try:
             df = self.fetch_snapshot(start_date=start_date, end_date=end_date)
             # 快照默认覆盖写，保证最新
-            result = self.save(df, update_on_conflict=True)
+            result = self.save(df, update_on_conflict=True, checkpoint=checkpoint)
+        except KeyboardInterrupt:
+            self.checkpoints.mark_interrupted(checkpoint["id"])
+            logger.warning(f"[{self.TASK_NAME}] 用户中断于快照 {scope}")
+            raise
         except Exception as e:
+            self.checkpoints.mark_failed(checkpoint["id"], e)
             logger.error(f"[{self.TASK_NAME}] 快照采集失败: {e}")
             self.record_failure(error=e)
             result = {"success": 0, "failed": 1}

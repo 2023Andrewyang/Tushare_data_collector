@@ -109,6 +109,38 @@ class PostgresManager:
         logger.info(f"[{table_name}] 写入 received={len(clean_rows)} affected={affected}")
         return {"affected": affected, "received": len(clean_rows)}
 
+    def bulk_upsert_and_complete_checkpoint(
+            self, table_name: str, rows: list, key_fields: list,
+            checkpoint_id: int, update_on_conflict: bool = False) -> dict:
+        """在同一事务中写入业务数据并将工作项标记为 succeeded。"""
+        table: Table = TABLES[table_name]
+        valid_cols = set(c.name for c in table.columns)
+        clean_rows = [{k: v for k, v in r.items() if k in valid_cols} for r in rows]
+        affected = 0
+        with self._engine.begin() as conn:
+            for i in range(0, len(clean_rows), BATCH_SIZE):
+                batch = clean_rows[i:i + BATCH_SIZE]
+                stmt = pg_insert(table).values(batch)
+                if update_on_conflict:
+                    update_cols = {c.name: stmt.excluded[c.name]
+                                   for c in table.columns
+                                   if c.name not in key_fields and c.name != "created_at"}
+                    stmt = (stmt.on_conflict_do_update(index_elements=key_fields,
+                                                       set_=update_cols)
+                            if update_cols else
+                            stmt.on_conflict_do_nothing(index_elements=key_fields))
+                else:
+                    stmt = stmt.on_conflict_do_nothing(index_elements=key_fields)
+                result = conn.execute(stmt)
+                affected += result.rowcount if result.rowcount and result.rowcount > 0 else 0
+            conn.execute(text(
+                "UPDATE collection_checkpoint SET status='succeeded', "
+                "received_rows=:received, affected_rows=:affected, last_error=NULL, "
+                "completed_at=now(), updated_at=now() WHERE id=:id"),
+                {"id": checkpoint_id, "received": len(clean_rows), "affected": affected})
+        logger.info(f"[{table_name}] 写入 received={len(clean_rows)} affected={affected}")
+        return {"affected": affected, "received": len(clean_rows)}
+
     # ---------- 查询 ----------
     def fetch_df(self, sql: str, params: dict = None) -> pd.DataFrame:
         with self._engine.connect() as conn:

@@ -5,7 +5,7 @@
   python main.py init     [--start YYYYMMDD] [--end YYYYMMDD] [--schema-only] [--collector X]
   python main.py update   [--date YYYYMMDD]  [--start --end]  [--collector X]
   python main.py retry    [--collector X] [--date D] [--start --end]
-  python main.py backfill --start --end [--collector X]
+  python main.py backfill --start --end [--collector X] [--resume]
   python main.py status   [--failures] [--date D]
 """
 import argparse
@@ -41,6 +41,8 @@ def build_parser():
     pb.add_argument("--start", required=True)
     pb.add_argument("--end", required=True)
     pb.add_argument("--collector")
+    pb.add_argument("--resume", action="store_true",
+                    help="跳过本次补录范围内已成功的工作项，用于中断后续传")
 
     ps = sub.add_parser("status", help="查看状态")
     ps.add_argument("--failures", action="store_true")

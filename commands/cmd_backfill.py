@@ -26,7 +26,8 @@ def run(args):
             continue
         logger.info(f"=== backfill [{name}] {start} - {end} (覆盖写) ===")
         try:
-            results[name] = Coll().run_backfill(start, end)
+            results[name] = Coll().run_backfill(
+                start, end, resume=getattr(args, "resume", False))
         except KeyboardInterrupt:
             logger.warning("用户中断 backfill")
             break

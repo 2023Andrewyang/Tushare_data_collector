@@ -29,7 +29,7 @@ class TopListCollector(DateBasedCollector):
     REQUIRED_POINTS = 2000
 
     def fetch_by_date(self, trade_date: str) -> pd.DataFrame:
-        # 先抓机构席位明细写入 top_inst（失败不影响 top_list 主流程）
+        # 两个接口必须同时成功，才能把该日期标为已完成；否则断点续传会重试。
         try:
             inst = self.client.query("top_inst", trade_date=trade_date,
                                      fields=_INST_FIELDS)
@@ -39,6 +39,6 @@ class TopListCollector(DateBasedCollector):
         except Exception as e:
             logger.error(f"[top_inst] {trade_date} 失败: {e}")
             self.failure.record_failure("top_inst", trade_date=trade_date, error=e)
+            raise
 
-        # 返回 top_list 数据，由基类完成对齐/写入
         return self.client.query("top_list", trade_date=trade_date, fields=_LIST_FIELDS)
