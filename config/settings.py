@@ -76,6 +76,8 @@ class TushareConfig:
     points: int = field(default_factory=lambda: _get_int("TUSHARE_POINTS", 5000))  # ★积分门控
     requests_per_minute: int = field(default_factory=lambda: _get_int("REQ_PER_MIN", 480))
     requests_per_second: float = field(default_factory=lambda: _get_float("REQ_PER_SEC", 8.0))
+    # 批量财务接口（fina_indicator/forecast/express）的读超时，单位秒
+    long_timeout: int = field(default_factory=lambda: _get_int("REQ_TIMEOUT_LONG", 180))
     max_retries: int = field(default_factory=lambda: _get_int("MAX_RETRIES", 3))
     retry_interval: float = field(default_factory=lambda: _get_float("RETRY_INTERVAL", 30))
     retry_backoff: float = 2.0

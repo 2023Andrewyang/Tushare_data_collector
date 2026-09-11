@@ -15,6 +15,10 @@ from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
+# 批量财务接口：一次返回全市场，代理端耗时可达 1 分钟，需要更长的读超时
+# （Tushare SDK 默认 30s，会 Read timed out）。
+LONG_TIMEOUT_APIS = {"fina_indicator", "forecast", "express"}
+
 
 class RateLimiter:
     """令牌桶限频器（线程安全）。"""
@@ -60,10 +64,15 @@ class TushareClient:
             raise ValueError("未配置 TUSHARE_TOKEN，请在 .env 中设置")
         ts.set_token(token)
         self._pro = ts.pro_api()
+        # 独立的长超时实例：客户端是多线程共享单例，不能按调用临时改超时。
+        self._pro_long = ts.pro_api()
         if settings.tushare.api_url:
             # Tushare 1.4.x 未公开自定义 endpoint 参数，兼容服务需覆盖 SDK 私有属性。
-            self._pro._DataApi__http_url = settings.tushare.api_url.rstrip("/")
+            url = settings.tushare.api_url.rstrip("/")
+            self._pro._DataApi__http_url = url
+            self._pro_long._DataApi__http_url = url
             logger.info("Tushare 客户端使用自定义 API 地址: %s", settings.tushare.api_url)
+        self._pro_long._DataApi__timeout = settings.tushare.long_timeout
         self._limiter = RateLimiter(
             settings.tushare.requests_per_second,
             int(settings.tushare.requests_per_second * 2))
@@ -81,13 +90,14 @@ class TushareClient:
         """通用取数。内置令牌桶限频 + 失败重试（指数退避）。"""
         last_exc = None
         delay = settings.tushare.retry_interval
+        pro = self._pro_long if api_name in LONG_TIMEOUT_APIS else self._pro
         for attempt in range(settings.tushare.max_retries + 1):
             try:
                 self._limiter.acquire()
                 if fields:
-                    df = self._pro.query(api_name, fields=fields, **kwargs)
+                    df = pro.query(api_name, fields=fields, **kwargs)
                 else:
-                    df = self._pro.query(api_name, **kwargs)
+                    df = pro.query(api_name, **kwargs)
                 return df if df is not None else pd.DataFrame()
             except Exception as e:
                 last_exc = e

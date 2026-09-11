@@ -48,7 +48,7 @@ daily_quote = Table(
     Column("open", Float), Column("high", Float),
     Column("low", Float), Column("close", Float),
     Column("pre_close", Float), Column("change", Float),
-    Column("pct_chg", Numeric(15, 4)),
+    Column("pct_chg", Numeric(24, 4)),
     Column("vol", Float), Column("amount", Float),
     Column("created_at", DateTime, server_default=func.now()),
 )
@@ -59,13 +59,13 @@ daily_basic = Table(
     Column("ts_code", String(20), primary_key=True),
     Column("trade_date", String(8), primary_key=True),
     Column("close", Float),
-    Column("turnover_rate", Numeric(15, 4)),
-    Column("turnover_rate_f", Numeric(15, 4)),
-    Column("volume_ratio", Numeric(15, 4)),
+    Column("turnover_rate", Numeric(24, 4)),
+    Column("turnover_rate_f", Numeric(24, 4)),
+    Column("volume_ratio", Numeric(24, 4)),
     Column("pe", Numeric(18, 4)), Column("pe_ttm", Numeric(18, 4)),
     Column("pb", Numeric(18, 4)),
     Column("ps", Numeric(18, 4)), Column("ps_ttm", Numeric(18, 4)),
-    Column("dv_ratio", Numeric(15, 4)), Column("dv_ttm", Numeric(15, 4)),
+    Column("dv_ratio", Numeric(24, 4)), Column("dv_ttm", Numeric(24, 4)),
     Column("total_share", Float), Column("float_share", Float),
     Column("free_share", Float),
     Column("total_mv", Numeric(20, 4)), Column("circ_mv", Numeric(20, 4)),
@@ -80,7 +80,7 @@ index_daily = Table(
     Column("open", Float), Column("high", Float),
     Column("low", Float), Column("close", Float),
     Column("pre_close", Float), Column("change", Float),
-    Column("pct_chg", Numeric(15, 4)),
+    Column("pct_chg", Numeric(24, 4)),
     Column("vol", Float), Column("amount", Float),
     # 来自 index_dailybasic
     Column("pe", Numeric(18, 4)), Column("pb", Numeric(18, 4)),
@@ -112,8 +112,8 @@ suspend = Table(   # 停复牌（接口 suspend_d）
     "suspend", metadata,
     Column("ts_code", String(20), primary_key=True),
     Column("trade_date", String(8), primary_key=True),
-    Column("suspend_timing", String(20)),
-    Column("suspend_type", String(2)),    # S 停牌 R 复牌
+    Column("suspend_timing", String(200)),   # 可为多段区间，如 10:05-10:15,10:15-10:25
+    Column("suspend_type", String(8)),    # S 停牌 R 复牌
     Column("created_at", DateTime, server_default=func.now()),
 )
 Index("idx_suspend_date", suspend.c.trade_date)
@@ -123,7 +123,7 @@ stock_st = Table(   # ST 列表（接口 stock_st，3000分）
     Column("ts_code", String(20), primary_key=True),
     Column("trade_date", String(8), primary_key=True),
     Column("name", String(30)),
-    Column("type", String(4)),
+    Column("type", String(8)),
     Column("type_name", String(30)),
     Column("created_at", DateTime, server_default=func.now()),
 )
@@ -135,15 +135,15 @@ dc_sector_daily = Table(   # 接口 dc_index
     Column("ts_code", String(20), primary_key=True),
     Column("trade_date", String(8), primary_key=True),
     Column("name", String(50)),
-    Column("sector_type", String(10)),    # 行业/概念/地域，按需从接口字段映射
-    Column("pct_change", Numeric(15, 4)),
+    Column("sector_type", String(20)),    # 行业/概念/地域，按需从接口字段映射
+    Column("pct_change", Numeric(24, 4)),
     Column("leading", String(30)),
     Column("leading_code", String(20)),
-    Column("leading_pct", Numeric(15, 4)),
+    Column("leading_pct", Numeric(24, 4)),
     Column("total_mv", Numeric(24, 4)),
-    Column("turnover_rate", Numeric(15, 4)),
+    Column("turnover_rate", Numeric(24, 4)),
     Column("up_num", Integer), Column("down_num", Integer),
-    Column("level", String(10)),
+    Column("level", String(20)),
     Column("created_at", DateTime, server_default=func.now()),
 )
 Index("idx_dc_sector_daily_date", dc_sector_daily.c.trade_date)
@@ -154,9 +154,9 @@ dc_sector_kline = Table(   # 接口 dc_daily
     Column("trade_date", String(8), primary_key=True),
     Column("open", Float), Column("high", Float),
     Column("low", Float), Column("close", Float),
-    Column("change", Float), Column("pct_change", Numeric(15, 4)),
+    Column("change", Float), Column("pct_change", Numeric(24, 4)),
     Column("vol", Float), Column("amount", Float),
-    Column("swing", Numeric(15, 4)), Column("turnover_rate", Numeric(15, 4)),
+    Column("swing", Numeric(24, 4)), Column("turnover_rate", Numeric(24, 4)),
     Column("created_at", DateTime, server_default=func.now()),
 )
 Index("idx_dc_sector_kline_date", dc_sector_kline.c.trade_date)
@@ -205,17 +205,17 @@ limit_list = Table(   # 接口 limit_list_d，涨跌停"列表"，2000分
     Column("ts_code", String(20), primary_key=True),
     Column("trade_date", String(8), primary_key=True),
     Column("name", String(30)),
-    Column("close", Float), Column("pct_chg", Numeric(15, 4)),
+    Column("close", Float), Column("pct_chg", Numeric(24, 4)),
     Column("amount", Float),
     Column("limit_amount", Numeric(20, 4)),
     Column("float_mv", Numeric(24, 4)), Column("total_mv", Numeric(24, 4)),
-    Column("turnover_ratio", Numeric(15, 4)),
+    Column("turnover_ratio", Numeric(24, 4)),
     Column("fd_amount", Numeric(20, 4)),
-    Column("first_time", String(10)), Column("last_time", String(10)),
+    Column("first_time", String(32)), Column("last_time", String(32)),
     Column("open_times", Integer),
-    Column("up_stat", String(20)),
+    Column("up_stat", String(32)),
     Column("limit_times", Integer),
-    Column("limit", String(2)),     # U 涨停 D 跌停 Z 炸板
+    Column("limit", String(8)),     # U 涨停 D 跌停 Z 炸板
     Column("created_at", DateTime, server_default=func.now()),
 )
 Index("idx_limit_list_date", limit_list.c.trade_date)
@@ -225,13 +225,13 @@ top_list = Table(   # 接口 top_list，2000分
     Column("ts_code", String(20), primary_key=True),
     Column("trade_date", String(8), primary_key=True),
     Column("name", String(30)),
-    Column("close", Float), Column("pct_change", Numeric(15, 4)),
-    Column("turnover_rate", Numeric(15, 4)),
+    Column("close", Float), Column("pct_change", Numeric(24, 4)),
+    Column("turnover_rate", Numeric(24, 4)),
     Column("amount", Float),
     Column("l_sell", Numeric(20, 4)), Column("l_buy", Numeric(20, 4)),
     Column("l_amount", Numeric(20, 4)),
-    Column("net_amount", Numeric(20, 4)), Column("net_rate", Numeric(15, 4)),
-    Column("amount_rate", Numeric(15, 4)),
+    Column("net_amount", Numeric(20, 4)), Column("net_rate", Numeric(24, 4)),
+    Column("amount_rate", Numeric(24, 4)),
     Column("float_values", Numeric(24, 4)),
     Column("reason", Text),
     Column("created_at", DateTime, server_default=func.now()),
@@ -243,9 +243,9 @@ top_inst = Table(   # 接口 top_inst，龙虎榜机构明细
     Column("ts_code", String(20), primary_key=True),
     Column("trade_date", String(8), primary_key=True),
     Column("exalter", String(200), primary_key=True),   # 营业部名称
-    Column("side", String(2)),
-    Column("buy", Numeric(20, 4)), Column("buy_rate", Numeric(15, 4)),
-    Column("sell", Numeric(20, 4)), Column("sell_rate", Numeric(15, 4)),
+    Column("side", String(8)),
+    Column("buy", Numeric(20, 4)), Column("buy_rate", Numeric(24, 4)),
+    Column("sell", Numeric(20, 4)), Column("sell_rate", Numeric(24, 4)),
     Column("net_buy", Numeric(20, 4)),
     Column("reason", Text),
     Column("created_at", DateTime, server_default=func.now()),
@@ -286,7 +286,7 @@ fina_indicator = Table(   # 接口 fina_indicator(_vip)，主键加 ann_date 修
     Column("ts_code", String(20), primary_key=True),
     Column("ann_date", String(8), primary_key=True),
     Column("end_date", String(8), primary_key=True),
-    Column("update_flag", String(2)),
+    Column("update_flag", String(8)),
     # === 每股指标 ===
     Column("eps", Numeric(20, 4)), Column("dt_eps", Numeric(20, 4)),
     Column("bps", Numeric(20, 4)), Column("cfps", Numeric(20, 4)),

@@ -72,6 +72,21 @@ class PostgresManager:
             return False
 
     # ---------- 写入（核心）----------
+    @staticmethod
+    def _dedupe(rows: list, key_fields: list) -> list:
+        """按主键去重（同键保留最后一条）。
+
+        ON CONFLICT DO UPDATE 在同一批数据里遇到重复键会直接报
+        CardinalityViolation（如 stock_basic 快照跨 list_status 拉取后
+        出现重复 ts_code），去重可让写入对上游重复数据免疫。
+        """
+        if not key_fields:
+            return rows
+        seen = {}
+        for r in rows:
+            seen[tuple(r.get(k) for k in key_fields)] = r
+        return list(seen.values())
+
     def bulk_upsert(self, table_name: str, rows: list, key_fields: list,
                     update_on_conflict: bool = False) -> dict:
         """批量写入，基于主键去重。
@@ -86,6 +101,7 @@ class PostgresManager:
         table: Table = TABLES[table_name]
         valid_cols = set(c.name for c in table.columns)
         clean_rows = [{k: v for k, v in r.items() if k in valid_cols} for r in rows]
+        clean_rows = self._dedupe(clean_rows, key_fields)   # 防 CardinalityViolation
 
         affected = 0
         with self._engine.begin() as conn:   # 单事务，分批
@@ -112,10 +128,16 @@ class PostgresManager:
     def bulk_upsert_and_complete_checkpoint(
             self, table_name: str, rows: list, key_fields: list,
             checkpoint_id: int, update_on_conflict: bool = False) -> dict:
-        """在同一事务中写入业务数据并将工作项标记为 succeeded。"""
+        """在同一事务中写入业务数据并结束工作项。
+
+        0 行的响应记为 'empty' 而非 'succeeded'：代理在并发压力下会偶发地
+        对整日返回空结果，若直接记成功就会留下永久空洞；'empty' 在工作项
+        领取时（status <> 'succeeded'）会被下次运行自动重试。
+        """
         table: Table = TABLES[table_name]
         valid_cols = set(c.name for c in table.columns)
         clean_rows = [{k: v for k, v in r.items() if k in valid_cols} for r in rows]
+        clean_rows = self._dedupe(clean_rows, key_fields)   # 防 CardinalityViolation
         affected = 0
         with self._engine.begin() as conn:
             for i in range(0, len(clean_rows), BATCH_SIZE):
@@ -133,12 +155,15 @@ class PostgresManager:
                     stmt = stmt.on_conflict_do_nothing(index_elements=key_fields)
                 result = conn.execute(stmt)
                 affected += result.rowcount if result.rowcount and result.rowcount > 0 else 0
+            status = "succeeded" if clean_rows else "empty"
             conn.execute(text(
-                "UPDATE collection_checkpoint SET status='succeeded', "
+                "UPDATE collection_checkpoint SET status=:status, "
                 "received_rows=:received, affected_rows=:affected, last_error=NULL, "
                 "completed_at=now(), updated_at=now() WHERE id=:id"),
-                {"id": checkpoint_id, "received": len(clean_rows), "affected": affected})
-        logger.info(f"[{table_name}] 写入 received={len(clean_rows)} affected={affected}")
+                {"id": checkpoint_id, "status": status,
+                 "received": len(clean_rows), "affected": affected})
+        logger.info(f"[{table_name}] 写入 received={len(clean_rows)} "
+                    f"affected={affected} status={status}")
         return {"affected": affected, "received": len(clean_rows)}
 
     # ---------- 查询 ----------

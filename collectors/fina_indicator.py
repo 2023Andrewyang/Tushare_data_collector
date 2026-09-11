@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""财务指标采集器（接口 fina_indicator_vip，5000 分）。
+"""财务指标采集器（接口 fina_indicator，5000 分）。
 
 按报告期(period)批量取全市场财务指标。主键 (ts_code, ann_date, end_date)，
 保留财报重述记录（修复 D4）。CORE_FIELDS 必须是 schema fina_indicator 列的子集。
@@ -44,4 +44,6 @@ class FinaIndicatorCollector(PeriodBasedCollector):
     _FIELDS = ",".join(CORE_FIELDS)
 
     def fetch_by_period(self, period: str) -> pd.DataFrame:
-        return self.client.query("fina_indicator_vip", period=period, fields=self._FIELDS)
+        # 不传 fields：兼容代理对本接口的字段白名单较窄，传长字段列表会瞬间
+        # 返回空结果（实测）；返回的全字段由 align_columns 按 schema 裁剪。
+        return self.client.query("fina_indicator", period=period)

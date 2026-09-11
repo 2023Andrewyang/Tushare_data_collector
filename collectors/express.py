@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""业绩快报采集器（接口 express_vip，2000 分）。"""
+"""业绩快报采集器（接口 express，2000 分）。"""
 import pandas as pd
 
 from config.settings import settings
@@ -18,4 +18,4 @@ class ExpressCollector(PeriodBasedCollector):
     REQUIRED_POINTS = 2000
 
     def fetch_by_period(self, period: str) -> pd.DataFrame:
-        return self.client.query("express_vip", period=period, fields=_FIELDS)
+        return self.client.query("express", period=period, fields=_FIELDS)
