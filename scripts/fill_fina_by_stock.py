@@ -8,6 +8,7 @@
 用法:
   python scripts/fill_fina_by_stock.py                     # 补默认的两个报告期
   python scripts/fill_fina_by_stock.py --periods 20230331 --workers 4
+  python scripts/fill_fina_by_stock.py --periods 20260630 --missing-only
 """
 import argparse
 import sys
@@ -30,6 +31,9 @@ def main():
     ap = argparse.ArgumentParser(description="按个股补齐 fina_indicator 报告期")
     ap.add_argument("--periods", default=DEFAULT_PERIODS)
     ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--missing-only", action="store_true",
+                    help="只查询该报告期尚无记录的股票，用于中断后续跑或"
+                         "收敛补齐，避免每次重复拉取全市场")
     args = ap.parse_args()
 
     setup_logging()
@@ -38,8 +42,20 @@ def main():
     codes = [r["ts_code"] for r in db.fetch_all(
         "SELECT ts_code FROM stock_basic ORDER BY ts_code")]
     periods = [p.strip() for p in args.periods.split(",") if p.strip()]
-    tasks = [(p, c) for p in periods for c in codes]
-    print(f"股票 {len(codes)} 只 × 报告期 {len(periods)} 个 = {len(tasks)} 次查询，"
+
+    tasks = []
+    for p in periods:
+        if args.missing_only:
+            have = {r["ts_code"] for r in db.fetch_all(
+                "SELECT DISTINCT ts_code FROM fina_indicator WHERE end_date=:p",
+                {"p": p})}
+            scope = [c for c in codes if c not in have]
+            print(f"报告期 {p}: 已有 {len(have)} 只，待补 {len(scope)} 只", flush=True)
+        else:
+            scope = codes
+        tasks.extend((p, c) for c in scope)
+
+    print(f"股票 {len(codes)} 只 × 报告期 {len(periods)} 个，本次查询 {len(tasks)} 次，"
           f"并发 {args.workers}", flush=True)
 
     def fetch(task):
